@@ -192,7 +192,7 @@ def _make_tiles(bbox, src_crs, minz, maxz):
         generator of [x, y, z] tiles that intersect
         the provided bounding box
     """
-    w, s, e, n = transform_bounds(*[src_crs, "EPSG:4326"] + bbox, densify_pts=0)
+    w, s, e, n = transform_bounds(*[src_crs, "EPSG:4326"] + bbox, densify_pts=21)
 
     EPSILON = 1.0e-10
 
@@ -322,6 +322,8 @@ class RGBTiler:
 
         # create a connection to the mbtiles file
         conn = sqlite3.connect(self.outpath)
+        # Wall mode : Speedup by 10 the speed of writing in the database
+        conn.execute('pragma journal_mode=wal')
         cur = conn.cursor()
 
         # create the tiles table
@@ -330,6 +332,10 @@ class RGBTiler:
             "(zoom_level integer, tile_column integer, "
             "tile_row integer, tile_data blob);"
         )
+
+        # create index on tiles for efficient access to this table
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS tile_index on tiles (zoom_level, tile_column, tile_row);")
+        
         # create empty metadata
         cur.execute("CREATE TABLE metadata (name text, value text);")
 
@@ -370,7 +376,8 @@ class RGBTiler:
         else:
             constrained_bbox = list(mercantile.bounds(self.bounding_tile))
             tiles = _make_tiles(constrained_bbox, "EPSG:4326", self.min_z, self.max_z)
-
+        
+        tilesCount = 0
         for tile, contents in self.pool.imap_unordered(self.run_function, tiles):
             x, y, z = tile
 
@@ -384,10 +391,25 @@ class RGBTiler:
                 "VALUES (?, ?, ?, ?);",
                 (z, x, tiley, buffer(contents)),
             )
-
-            conn.commit()
-
+            tilesCount = tilesCount + 1
+            # commit data every 1000 tiles (about 150 Mo)
+            # Otherwise, the file .mbtiles-wal becomes huge (same size as the final file). The result is the need to have twice the size of the final Mbtiles on the hard drive
+            if (tilesCount % 1000 == 0):
+                conn.commit()
+                print(" ")
+                print("####################### commit: ")
+                print(" ")
+                
+        conn.commit()
+        print(" ")
+        print("####################### commit: ")
+        print(" ")
+        # disable Wall mode
+        conn.execute('pragma journal_mode=DELETE')
+        print("BEFORE CLOSE: ")
         conn.close()
+        print("AFTER CLOSE: ")
+        print(" ")
 
         self.pool.close()
         self.pool.join()
